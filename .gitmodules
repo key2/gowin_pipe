@@ -1,0 +1,3 @@
+[submodule "gowin-serdes"]
+	path = gowin-serdes
+	url = https://github.com/key2/gowin-serdes.git

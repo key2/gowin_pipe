@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Build artifacts
+example/build/
+example/serdes.csr
+example/serdes.toml
+
+# Gowin PLL generated files
+example/src/
+
+# Editor backups
+*~
+*.swp
+*.swo
+
+# Cache
+.pytest_cache/
+.ruff_cache/
+
+# PDFs (copyrighted specs — not redistributable)
+*.pdf
+
+# Working markdown files (internal notes)
+PIPE_SERDES_CONVERSION_PLAN.md
+CUSTOM_PHY_CSR_MAP.md
+PIPE_SerDes_IO_Reference.md
+
+# Decrypted vendor IP (not redistributable)
+example/usb3_0_phy_decrypted.v

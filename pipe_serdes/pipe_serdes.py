@@ -1,0 +1,529 @@
+"""Top-level self-contained PIPE SerDes PHY.
+
+Assembles the PIPE adapter layer, the GowinSerDes hardware hard macro,
+and all internal wiring into a single user-facing component.  The user
+only sees the PIPE interface, debug outputs, and a power-on-reset input.
+
+Architecture
+------------
+::
+
+    ┌─────────────────────────────────────────────────────┐
+    │  PIPESerDes  (this module)                          │
+    │                                                     │
+    │   por_n ──────────────────────────┐                 │
+    │                                   ▼                 │
+    │   ┌────────────────────────────────────────┐        │
+    │   │  GowinSerDes  (GTR12 hard macro)       │        │
+    │   │   ├── QUAD instance(s)                 │        │
+    │   │   ├── UPAR arbiter                     │        │
+    │   │   └── Life-clock → "upar" domain       │        │
+    │   └──────┬──────────────────┬──────────────┘        │
+    │     lane │                  │ DRP                    │
+    │   ┌──────┴──────────────────┴──────────────┐        │
+    │   │  PIPESerDesAdapter                     │        │
+    │   │   ┌──────────┐  ┌───────────────┐      │        │
+    │   │   │ TX Path  │  │ Power FSM     │      │        │
+    │   │   ├──────────┤  ├───────────────┤      │        │
+    │   │   │ RX Path  │  │ Rate Ctrl     │      │        │
+    │   │   ├──────────┤  ├───────────────┤      │        │
+    │   │   │ RxDet    │  │ LFPS Ctrl     │      │        │
+    │   │   ├──────────┤  ├───────────────┤      │        │
+    │   │   │ MsgBus   │  │ CSR Bridge    │      │        │
+    │   │   ├──────────┤  ├───────────────┤      │        │
+    │   │   │ MacCLK   │  │ DRP Mux       │      │        │
+    │   │   └──────────┘  └───────────────┘      │        │
+    │   └────────────────────────────────────────┘        │
+    │                                                     │
+    │   Exposed:  pipe  ←── PIPE Rev 7.1 interface        │
+    │             debug ←── read-only status outputs       │
+    │             por_n ──→ power-on reset to GowinSerDes  │
+    └─────────────────────────────────────────────────────┘
+
+The ``PIPESerDes`` component is fully self-contained.  It internally
+creates and wires the ``GowinSerDes`` (hard macro driver),
+``GowinSerDesGroup`` (lane grouping), and ``PIPESerDesAdapter`` (PIPE
+protocol engine).  The user does **not** need to touch lane signals,
+DRP ports, or PCS clock routing — all of that is handled inside.
+
+Exposed ports:
+
+``pipe``
+    The PIPE Rev 7.1 low-pin-count interface (see ``PIPESerDesSignature``).
+    This is what the MAC layer connects to.
+
+``debug``
+    Read-only debug/status outputs for ILA probes, LEDs, or a debug
+    register file (see ``PIPEDebugSignature``).  Includes
+    ``serdes_arb_state`` (2-bit) from the GowinSerDes UPAR arbiter.
+
+``por_n``
+    Active-low power-on reset input.  Directly drives ``GowinSerDes.por_n``.
+    The user must assert this high after board-level power is stable.
+
+Configurable via ``PIPELaneConfig`` for:
+
+- Protocol: USB3, SATA, DP
+- Device: GowinDevice (GW5AST_138, etc.)
+- Rate: Gen1 (5 GT/s), Gen2 (10 GT/s)
+- Data width: 10, 20, 32, 40, 64, 80 bits
+- Quad/lane selection (inside config)
+- Message bus enable
+- MacCLK enable
+
+Usage Example
+-------------
+::
+
+    from gowin_serdes.config import GowinDevice
+    from pipe_serdes import PIPESerDes, PIPELaneConfig, PIPEProtocol, USBRate, PIPEWidth
+
+    cfg = PIPELaneConfig(
+        protocol=PIPEProtocol.USB3,
+        device=GowinDevice.GW5AST_138,
+        quad=0, lane=0,
+        supported_rates=[USBRate.GEN1],
+        default_width=PIPEWidth.W40,
+    )
+    phy = PIPESerDes(cfg)
+
+    # In elaborate():
+    m.submodules.phy = DomainRenamer("upar")(phy)
+    m.d.comb += [
+        phy.por_n.eq(1),
+        phy.pipe.reset_n.eq(my_reset_n),
+        phy.pipe.power_down.eq(my_power_down),
+        my_rx_data.eq(phy.pipe.rx_data),
+    ]
+
+    # To generate the .csr file for Gowin PnR:
+    phy.generate_csr("serdes.csr", toml_path="serdes.toml")
+"""
+
+import sys
+from typing import Optional
+
+from amaranth.hdl import Signal, Module
+from amaranth.lib.wiring import Component, In, Out
+
+from .pipe_config import PIPELaneConfig, PIPEWidth, PIPE_WIDTH_MAP
+from .pipe_signature import PIPESerDesSignature, PIPEDebugSignature
+from .pipe_adapter import PIPESerDesAdapter
+
+# Ensure gowin_serdes is importable
+sys.path.insert(0, "/home/key2/Downloads/amaranth/serdes_pipe/gowin-serdes")
+
+from gowin_serdes import GowinSerDes, GowinSerDesGroup  # noqa: E402
+
+
+class PIPESerDes(Component):
+    """Top-level self-contained PIPE SerDes PHY.
+
+    Creates and wires ``GowinSerDes`` + ``GowinSerDesGroup`` +
+    ``PIPESerDesAdapter`` internally.  The user only interacts with
+    three port groups:
+
+    - ``pipe`` — the PIPE Rev 7.1 interface (MAC ↔ PHY)
+    - ``debug`` — read-only debug/status outputs
+    - ``por_n`` — power-on reset input to the SerDes hard macro
+
+    All internal wiring (lane TX/RX data, DRP bus, PCS clock loopback,
+    reset routing, status feedback) is handled automatically.
+
+    Parameters
+    ----------
+    pipe_config : PIPELaneConfig
+        PIPE-layer configuration specifying protocol, device, quad, lane,
+        supported rates, data width, and feature enables.  The ``quad``,
+        ``lane``, and ``device`` fields are extracted from this config —
+        no separate kwargs needed.
+
+    Attributes
+    ----------
+    pipe : PIPESerDesSignature
+        The PIPE Rev 7.1 interface.  Direction is ``Out`` from this
+        component's perspective, meaning the MAC connects to the flipped
+        view.
+
+        Data path:
+            - ``tx_data``               : In(data_width) — MAC → PHY transmit data
+            - ``tx_data_valid``         : In(1) — TX data qualifier
+            - ``rx_data``               : Out(data_width) — PHY → MAC receive data
+
+        Clocks:
+            - ``pclk``                  : In(1) — MAC-supplied parallel clock
+            - ``max_pclk``              : Out(1) — PHY-generated max-rate PCLK
+            - ``rx_clk``                : Out(1) — CDR-recovered byte clock
+
+        Command (MAC → PHY):
+            - ``phy_mode``              : In(4) — Protocol selector
+            - ``reset_n``               : In(1) — Active-low async reset
+            - ``power_down``            : In(4) — Power state request (P0–P3)
+            - ``rate``                  : In(4) — Line rate selector
+            - ``width``                 : In(3) — TX width selector
+            - ``rx_width``              : In(3) — RX width selector
+            - ``tx_elec_idle``          : In(4) — TX electrical idle
+            - ``tx_detect_rx_loopback`` : In(1) — Receiver detect trigger
+            - ``rx_polarity``           : In(1) — [USB] RX polarity inversion
+            - ``rx_termination``        : In(1) — [USB] RX termination control
+            - ``rx_standby``            : In(1) — [USB/SATA] RX standby
+            - ``pclk_change_ack``       : In(1) — [USB/SATA] PCLK change ack
+
+        Status (PHY → MAC):
+            - ``phy_status``            : Out(1) — Completion pulse
+            - ``rx_valid``              : Out(1) — RX data valid
+            - ``rx_elec_idle``          : Out(1) — RX electrical idle detect
+            - ``rx_status``             : Out(3) — [USB/SATA] RX status code
+            - ``pclk_change_ok``        : Out(1) — [USB/SATA] PCLK change ready
+
+        Message bus:
+            - ``m2p_msg_bus``           : In(8) — MAC-to-PHY messages
+            - ``p2m_msg_bus``           : Out(8) — PHY-to-MAC messages
+
+        MacCLK domain:
+            - ``mac_clk_reset_n``       : In(1) — MacCLK domain reset
+            - ``mac_clk_rate``          : In(5) — MacCLK rate selector
+            - ``mac_clk_req``           : In(1) — MacCLK request
+            - ``mac_clk_ack``           : Out(1) — MacCLK acknowledge
+            - ``mac_clk``              : Out(1) — MacCLK output
+
+    debug : PIPEDebugSignature
+        Read-only debug outputs for internal state observation:
+            - ``power_state``       : Out(4) — Current PIPE power state
+            - ``rate_fsm_state``    : Out(4) — Rate-change FSM state
+            - ``rxdet_fsm_state``   : Out(4) — Receiver-detect FSM state
+            - ``lfps_fsm_state``    : Out(4) — LFPS FSM state
+            - ``msgbus_fsm_state``  : Out(4) — Message bus FSM state
+            - ``drp_mux_owner``     : Out(4) — DRP arbiter current owner
+            - ``drp_mux_locked``    : Out(1) — DRP bus locked
+            - ``drp_busy``          : Out(1) — DRP transaction in progress
+            - ``pll_lock``          : Out(1) — PLL lock indicator
+            - ``cdr_lock``          : Out(1) — CDR lock indicator
+            - ``serdes_arb_state``  : Out(2) — GowinSerDes UPAR arbiter state
+
+    por_n : In(1)
+        Power-on reset input (active low).  Must be driven high by the
+        user after board power is stable.  Directly forwarded to the
+        internal ``GowinSerDes.por_n`` port.
+    """
+
+    def __init__(self, pipe_config: PIPELaneConfig):
+        self._config = pipe_config
+
+        data_width = pipe_config.max_data_width
+
+        members = {}
+
+        # PIPE interface — direction is Out from PHY's perspective;
+        # the MAC sees the flipped (In) view when it connects.
+        members["pipe"] = Out(
+            PIPESerDesSignature(
+                data_width=data_width,
+                usb=(pipe_config.protocol.value == 1),
+                sata=(pipe_config.protocol.value == 2),
+                dp=(pipe_config.protocol.value == 3),
+            )
+        )
+
+        # Debug interface — always present, read-only status outputs
+        members["debug"] = Out(PIPEDebugSignature())
+
+        # Power-on reset — user drives this high after power is stable
+        members["por_n"] = In(1)
+
+        super().__init__(members)
+
+    # ── CSR generation ────────────────────────────────────────────
+
+    def generate_csr(
+        self,
+        output_path: str,
+        toml_path: Optional[str] = None,
+        gowin_bin_dir: Optional[str] = None,
+    ):
+        """Generate the SerDes ``.csr`` file needed by the Gowin PnR tool.
+
+        Creates a fresh ``GowinSerDes`` + ``GowinSerDesGroup`` from the
+        stored configuration, then delegates to
+        ``GowinSerDes.generate_csr()``.
+
+        Parameters
+        ----------
+        output_path : str
+            Where to write the ``.csr`` file.
+        toml_path : str or None
+            If given, keep the intermediate TOML file at this path.
+            Otherwise a temporary file is used and cleaned up.
+        gowin_bin_dir : str or None
+            Explicit path to the Gowin IDE ``bin/`` directory.
+            If None, the tool is searched on ``$PATH``,
+            then ``$GOWIN_IDE/bin/``.
+
+        Returns
+        -------
+        str
+            The *output_path*.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the Gowin CSR tool binary is not found.
+        subprocess.CalledProcessError
+            If the tool exits non-zero.
+        """
+        lane_config = self._config.to_lane_config()
+        group = GowinSerDesGroup(
+            quad=self._config.quad,
+            first_lane=self._config.lane,
+            lane_configs=[lane_config],
+        )
+        serdes = GowinSerDes(device=self._config.device, groups=[group])
+        return serdes.generate_csr(
+            output_path=output_path,
+            toml_path=toml_path,
+            gowin_bin_dir=gowin_bin_dir,
+        )
+
+    # ── Elaboration ───────────────────────────────────────────────
+
+    def elaborate(self, platform):
+        """Build the complete PIPE SerDes hardware.
+
+        Internally instantiates:
+
+        1. ``GowinSerDes`` with a single ``GowinSerDesGroup`` matching
+           the configured quad/lane/rate/width.
+        2. ``PIPESerDesAdapter`` containing all PIPE sub-controllers
+           (power FSM, rate controller, TX/RX paths, RxDet, LFPS,
+           message bus, CSR bridge, MacCLK generator, DRP mux).
+
+        Then wires everything together:
+
+        - ``por_n`` → GowinSerDes
+        - PCS clock loopback (rx.clk ← rx.pcs_clkout, tx.clk ← tx.pcs_clkout)
+        - Adapter lane ↔ GowinSerDesLane (TX data, RX data, status, resets)
+        - Adapter DRP ↔ GowinSerDes DRP port
+        - Adapter pipe ↔ self.pipe (PIPE interface passthrough)
+        - Adapter debug ↔ self.debug (debug outputs passthrough)
+        - GowinSerDes ``dbg_arb_state`` → self.debug.serdes_arb_state
+
+        Returns
+        -------
+        Module
+            The elaborated Amaranth module containing the complete PHY.
+        """
+        m = Module()
+
+        cfg = self._config
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (a): Create GowinSerDes internally
+        # ══════════════════════════════════════════════════════════
+        lane_config = cfg.to_lane_config()
+        group = GowinSerDesGroup(
+            quad=cfg.quad,
+            first_lane=cfg.lane,
+            lane_configs=[lane_config],
+        )
+        serdes = GowinSerDes(device=cfg.device, groups=[group])
+        m.submodules.serdes = serdes
+
+        # Forward power-on reset from user to the hard macro
+        m.d.comb += serdes.por_n.eq(self.por_n)
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (b): Get lane and DRP references
+        # ══════════════════════════════════════════════════════════
+        lane0 = group.lanes[0]
+        drp = getattr(serdes, f"drp_q{cfg.quad}_ln{cfg.lane}")
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (c): PCS clock loopback
+        #
+        #  The GTR12 PCS needs an explicit clock source.  We loop
+        #  the PCS clock outputs back to the PCS clock inputs so
+        #  the TX and RX PCS blocks run off their own generated
+        #  clocks.  This is the standard self-clocking configuration.
+        # ══════════════════════════════════════════════════════════
+        m.d.comb += [
+            lane0.rx.clk.eq(lane0.rx.pcs_clkout),
+            lane0.tx.clk.eq(lane0.tx.pcs_clkout),
+        ]
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (d): Create PIPE adapter (all sub-controllers)
+        # ══════════════════════════════════════════════════════════
+        adapter = PIPESerDesAdapter(
+            cfg,
+            quad=cfg.quad,
+            lane=cfg.lane,
+        )
+        m.submodules.adapter = adapter
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (e): Wire adapter.lane ↔ GowinSerDesLane
+        # ══════════════════════════════════════════════════════════
+
+        # --- TX data path → lane ---
+        m.d.comb += [
+            lane0.tx.data.eq(adapter.lane.tx.data),
+            lane0.tx.fifo_wren.eq(adapter.lane.tx.fifo_wren),
+        ]
+
+        # --- RX data path ← lane ---
+        m.d.comb += [
+            adapter.lane.rx.data.eq(lane0.rx.data),
+            adapter.lane.rx.valid.eq(lane0.rx.valid),
+            lane0.rx.fifo_rden.eq(adapter.lane.rx.fifo_rden),
+        ]
+
+        # --- PCS clock feedback (lane → adapter) ---
+        m.d.comb += [
+            adapter.lane.tx.pcs_clkout.eq(lane0.tx.pcs_clkout),
+            adapter.lane.rx.pcs_clkout.eq(lane0.rx.pcs_clkout),
+        ]
+
+        # --- Status (lane → adapter) ---
+        m.d.comb += [
+            adapter.lane.status.ready.eq(lane0.status.ready),
+            adapter.lane.status.pll_lock.eq(lane0.status.pll_lock),
+            adapter.lane.status.rx_cdr_lock.eq(lane0.status.rx_cdr_lock),
+            adapter.lane.status.signal_detect.eq(lane0.status.signal_detect),
+        ]
+
+        # --- Resets (adapter → lane) ---
+        m.d.comb += [
+            lane0.reset.pma_rstn.eq(adapter.lane.reset.pma_rstn),
+            lane0.reset.pcs_rx_rst.eq(adapter.lane.reset.pcs_rx_rst),
+            lane0.reset.pcs_tx_rst.eq(adapter.lane.reset.pcs_tx_rst),
+        ]
+
+        # --- Misc lane signals ---
+        m.d.comb += [
+            adapter.lane.rx_elec_idle.eq(
+                0
+            ),  # TODO: wire when lane exposes RXELECIDLE_O
+            adapter.lane.life_clk.eq(
+                0
+            ),  # Not used by adapter (life_clk is internal to GowinSerDes)
+        ]
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (f): Wire adapter.drp ↔ GowinSerDes DRP port
+        # ══════════════════════════════════════════════════════════
+        m.d.comb += [
+            # Request: adapter → SerDes arbiter
+            drp.addr.eq(adapter.drp.addr),
+            drp.wren.eq(adapter.drp.wren),
+            drp.wrdata.eq(adapter.drp.wrdata),
+            drp.strb.eq(adapter.drp.strb),
+            drp.rden.eq(adapter.drp.rden),
+            # Response: SerDes arbiter → adapter
+            adapter.drp.ready.eq(drp.ready),
+            adapter.drp.rdvld.eq(drp.rdvld),
+            adapter.drp.rddata.eq(drp.rddata),
+            adapter.drp.resp.eq(drp.resp),
+        ]
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (g): Wire adapter.pipe ↔ self.pipe
+        #
+        #  The adapter's PIPE sub-interface is a typed
+        #  PIPESerDesSignature.  We forward every signal between
+        #  the adapter and the user-facing component port.
+        # ══════════════════════════════════════════════════════════
+
+        # --- Data path ---
+        m.d.comb += [
+            adapter.pipe.tx_data.eq(self.pipe.tx_data),
+            adapter.pipe.tx_data_valid.eq(self.pipe.tx_data_valid),
+            self.pipe.rx_data.eq(adapter.pipe.rx_data),
+        ]
+
+        # --- Clock interface ---
+        m.d.comb += [
+            self.pipe.max_pclk.eq(adapter.pipe.max_pclk),
+            self.pipe.rx_clk.eq(adapter.pipe.rx_clk),
+        ]
+
+        # --- Command interface (MAC → PHY) ---
+        m.d.comb += [
+            adapter.pipe.phy_mode.eq(self.pipe.phy_mode),
+            adapter.pipe.reset_n.eq(self.pipe.reset_n),
+            adapter.pipe.power_down.eq(self.pipe.power_down),
+            adapter.pipe.rate.eq(self.pipe.rate),
+            adapter.pipe.width.eq(self.pipe.width),
+            adapter.pipe.rx_width.eq(self.pipe.rx_width),
+            adapter.pipe.tx_elec_idle.eq(self.pipe.tx_elec_idle),
+            adapter.pipe.tx_detect_rx_loopback.eq(self.pipe.tx_detect_rx_loopback),
+        ]
+
+        # USB-only command signals (conditionally present in signature)
+        if hasattr(self.pipe, "rx_polarity"):
+            m.d.comb += adapter.pipe.rx_polarity.eq(self.pipe.rx_polarity)
+        if hasattr(self.pipe, "rx_termination"):
+            m.d.comb += adapter.pipe.rx_termination.eq(self.pipe.rx_termination)
+
+        # USB + SATA shared command signals
+        if hasattr(self.pipe, "rx_standby"):
+            m.d.comb += adapter.pipe.rx_standby.eq(self.pipe.rx_standby)
+        if hasattr(self.pipe, "pclk_change_ack"):
+            m.d.comb += adapter.pipe.pclk_change_ack.eq(self.pipe.pclk_change_ack)
+
+        # --- Status interface (PHY → MAC) ---
+        m.d.comb += [
+            self.pipe.phy_status.eq(adapter.pipe.phy_status),
+            self.pipe.rx_valid.eq(adapter.pipe.rx_valid),
+            self.pipe.rx_elec_idle.eq(adapter.pipe.rx_elec_idle),
+        ]
+
+        # USB + SATA shared status signals
+        if hasattr(self.pipe, "rx_status"):
+            m.d.comb += self.pipe.rx_status.eq(adapter.pipe.rx_status)
+        if hasattr(self.pipe, "pclk_change_ok"):
+            m.d.comb += self.pipe.pclk_change_ok.eq(adapter.pipe.pclk_change_ok)
+
+        # --- Message bus ---
+        m.d.comb += [
+            adapter.pipe.m2p_msg_bus.eq(self.pipe.m2p_msg_bus),
+            self.pipe.p2m_msg_bus.eq(adapter.pipe.p2m_msg_bus),
+        ]
+
+        # --- MacCLK domain ---
+        m.d.comb += [
+            adapter.pipe.mac_clk_reset_n.eq(self.pipe.mac_clk_reset_n),
+            adapter.pipe.mac_clk_rate.eq(self.pipe.mac_clk_rate),
+            adapter.pipe.mac_clk_req.eq(self.pipe.mac_clk_req),
+            self.pipe.mac_clk_ack.eq(adapter.pipe.mac_clk_ack),
+            self.pipe.mac_clk.eq(adapter.pipe.mac_clk),
+        ]
+
+        # --- PCLK passthrough ---
+        m.d.comb += adapter.pipe.pclk.eq(self.pipe.pclk)
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (h): Wire adapter.debug ↔ self.debug
+        # ══════════════════════════════════════════════════════════
+        m.d.comb += [
+            self.debug.power_state.eq(adapter.debug.power_state),
+            self.debug.rate_fsm_state.eq(adapter.debug.rate_fsm_state),
+            self.debug.rxdet_fsm_state.eq(adapter.debug.rxdet_fsm_state),
+            self.debug.lfps_fsm_state.eq(adapter.debug.lfps_fsm_state),
+            self.debug.msgbus_fsm_state.eq(adapter.debug.msgbus_fsm_state),
+            self.debug.drp_mux_owner.eq(adapter.debug.drp_mux_owner),
+            self.debug.drp_mux_locked.eq(adapter.debug.drp_mux_locked),
+            self.debug.drp_busy.eq(adapter.debug.drp_busy),
+            self.debug.pll_lock.eq(adapter.debug.pll_lock),
+            self.debug.cdr_lock.eq(adapter.debug.cdr_lock),
+        ]
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (i): GowinSerDes debug — UPAR arbiter state
+        #
+        #  The GowinSerDes exposes a 2-bit ``dbg_arb_state`` that
+        #  indicates the UPAR arbiter's internal state.  We surface
+        #  this on the debug interface for anti-sweep / ILA use.
+        # ══════════════════════════════════════════════════════════
+        m.d.comb += self.debug.serdes_arb_state.eq(serdes.dbg_arb_state)
+
+        return m
