@@ -281,6 +281,13 @@ class PIPESerDesAdapter(wiring.Component):
         self._lane = lane
         dw = config.max_data_width
 
+        # Exposed for LFPS gen wiring (not part of PIPE signature;
+        # internal PHY signal consumed by PIPELFPSGen in pipe_serdes.py).
+        self.lfps_active = Signal(name="adapter_lfps_active")
+        # Raw MAC tx_elec_idle — LFPS controller and RxDet must see the
+        # MAC's original intent, NOT the post-LFPS-gen muxed value.
+        self.mac_tx_elec_idle_raw = Signal(name="mac_tx_eidle_raw")
+
         # Build the component signature with typed sub-interfaces.
         # Directions are from the adapter's (PHY's) perspective.
         members = {
@@ -367,6 +374,7 @@ class PIPESerDesAdapter(wiring.Component):
             power.cdr_lock.eq(lane.status.rx_cdr_lock),
             power.rate_change_ip.eq(rate.rate_change_ip),
             power.lfps_active.eq(lfps.lfps_active),
+            self.lfps_active.eq(lfps.lfps_active),
         ]
 
         # --- Rate controller inputs ---
@@ -397,14 +405,14 @@ class PIPESerDesAdapter(wiring.Component):
         # --- Receiver detection inputs ---
         m.d.comb += [
             rxdet.tx_detect_rx.eq(pipe.tx_detect_rx_loopback),
-            rxdet.tx_elec_idle.eq(pipe.tx_elec_idle[0]),
+            rxdet.tx_elec_idle.eq(self.mac_tx_elec_idle_raw),
             rxdet.current_power.eq(power.current_state),
             rxdet.reset_n.eq(pipe.reset_n),
         ]
 
         # --- LFPS controller inputs ---
         m.d.comb += [
-            lfps.tx_elec_idle.eq(pipe.tx_elec_idle[0]),
+            lfps.tx_elec_idle.eq(self.mac_tx_elec_idle_raw),
             lfps.tx_detect_rx.eq(pipe.tx_detect_rx_loopback),
             lfps.current_power.eq(power.current_state),
             lfps.rx_elec_idle_hw.eq(lane.rx_elec_idle),

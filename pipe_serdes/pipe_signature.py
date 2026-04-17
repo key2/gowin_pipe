@@ -125,6 +125,10 @@ class PIPESerDesSignature(Signature):
             members["rx_polarity"] = In(1)
             # RX termination control (enable/disable 45 Ω termination).
             members["rx_termination"] = In(1)
+            # MAC transmit LFPS mode (PIPE §8.10).
+            # 0 = PHY generates LFPS pattern (default).
+            # 1 = MAC drives LFPS on TxData (for Gen2 PWM/LBPM).
+            members["mac_transmit_lfps"] = In(1)
 
         # USB + SATA shared command signals
         if usb or sata:

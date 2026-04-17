@@ -103,12 +103,14 @@ Usage Example
 import sys
 from typing import Optional
 
-from amaranth.hdl import Signal, Module
+from amaranth.hdl import Signal, Module, ClockDomain, ClockSignal, DomainRenamer
+from amaranth.lib.cdc import FFSynchronizer
 from amaranth.lib.wiring import Component, In, Out
 
 from .pipe_config import PIPELaneConfig, PIPEWidth, PIPE_WIDTH_MAP
 from .pipe_signature import PIPESerDesSignature, PIPEDebugSignature
 from .pipe_adapter import PIPESerDesAdapter
+from .pipe_lfps_gen import PIPELFPSGen
 
 # Ensure gowin_serdes is importable
 sys.path.insert(0, "/home/key2/Downloads/amaranth/serdes_pipe/gowin-serdes")
@@ -338,17 +340,35 @@ class PIPESerDes(Component):
         drp = getattr(serdes, f"drp_q{cfg.quad}_ln{cfg.lane}")
 
         # ══════════════════════════════════════════════════════════
-        #  Step (c): PCS clock loopback
+        #  Step (c): PCS clock loopback + TX clock domain
         #
         #  The GTR12 PCS needs an explicit clock source.  We loop
         #  the PCS clock outputs back to the PCS clock inputs so
         #  the TX and RX PCS blocks run off their own generated
         #  clocks.  This is the standard self-clocking configuration.
+        #
+        #  We also create a ``pclk_tx`` clock domain from the TX PCS
+        #  output.  This is the clock the serializer samples tx_data
+        #  on (125 MHz for Gen1 W40).  The LFPS pattern generator
+        #  runs in this domain to produce clean edges.
+        #
+        #  Note: pclk_tx is only valid after CMU PLL lock.  The LFPS
+        #  generator is only enabled when lfps_active is high, which
+        #  happens after the LFPS controller (running in upar/sync)
+        #  has completed FFE setup — well after PLL lock.
+        #
+        #  We do NOT create a pclk_rx domain here.  The RX path
+        #  stays in the upar domain.  A proper pclk_rx domain
+        #  (from CDR recovered clock) can be added later when
+        #  needed for RX elastic buffer / data processing.
         # ══════════════════════════════════════════════════════════
         m.d.comb += [
             lane0.rx.clk.eq(lane0.rx.pcs_clkout),
             lane0.tx.clk.eq(lane0.tx.pcs_clkout),
         ]
+
+        m.domains += ClockDomain("pclk_tx", local=True, async_reset=True)
+        m.d.comb += ClockSignal("pclk_tx").eq(lane0.tx.pcs_clkout)
 
         # ══════════════════════════════════════════════════════════
         #  Step (d): Create PIPE adapter (all sub-controllers)
@@ -359,6 +379,76 @@ class PIPESerDes(Component):
             lane=cfg.lane,
         )
         m.submodules.adapter = adapter
+
+        # ══════════════════════════════════════════════════════════
+        #  Step (d2): LFPS pattern generator (pclk_tx domain)
+        #
+        #  Sits between PIPE tx_data and the adapter txpath.
+        #  In PHY-LFPS mode (MacTransmitLFPS=0): muxes in the
+        #  internal all-1s/all-0s pattern at pclk_tx rate.
+        #  In MAC-LFPS mode (MacTransmitLFPS=1): passes MAC's
+        #  tx_data straight through.
+        #  When not in LFPS: always passes through.
+        #
+        #  The LFPS gen runs in pclk_tx (TX PCS clock, 125 MHz
+        #  for Gen1 W40).  lfps_active comes from the LFPS
+        #  controller in upar, so we CDC it to pclk_tx.
+        #  mac_transmit_lfps comes from the MAC in whatever domain
+        #  the MAC runs — we CDC it to pclk_tx too.
+        # ══════════════════════════════════════════════════════════
+        fabric_width = cfg.max_data_width
+        # Determine line rate from the first (default) supported rate.
+        # USBRate.GEN1 = 0 → 5 GT/s, USBRate.GEN2 = 1 → 10 GT/s
+        from .pipe_config import USBRate
+
+        default_rate = cfg.supported_rates[0] if cfg.supported_rates else USBRate.GEN1
+        line_rate_hz = 5_000_000_000 if default_rate == USBRate.GEN1 else 10_000_000_000
+
+        # PCS_TX_O_FABRIC_CLK = line_rate / fabric_width (SDR).
+        # Confirmed by hardware counter measurement: 125 MHz for Gen1 W40.
+        pclk_hz = line_rate_hz // fabric_width
+        print(
+            f"[PIPESerDes] LFPS gen: width={fabric_width} line_rate={line_rate_hz / 1e9}G "
+            f"pclk_hz={pclk_hz} ({pclk_hz / 1e6} MHz)"
+        )
+        lfps_gen = PIPELFPSGen(width=fabric_width, pclk_hz=pclk_hz)
+        print(
+            f"[PIPESerDes] LFPS gen instantiated: half_period={lfps_gen.half_period} "
+            f"expected_freq={pclk_hz / (2 * lfps_gen.half_period) / 1e6} MHz"
+        )
+        m.submodules.lfps_gen = DomainRenamer("pclk_tx")(lfps_gen)
+
+        # CDC: lfps_active (upar → pclk_tx)
+        lfps_active_pclk = Signal(name="lfps_active_pclk")
+        m.submodules += FFSynchronizer(
+            adapter.lfps_active, lfps_active_pclk, o_domain="pclk_tx"
+        )
+
+        # CDC: mac_transmit_lfps (MAC domain → pclk_tx)
+        # The MAC drives this through the PIPE interface;
+        # it changes rarely (once before entering P0 for LFPS).
+        mac_transmit_lfps_pclk = Signal(name="mac_xmit_lfps_pclk")
+        m.submodules += FFSynchronizer(
+            self.pipe.mac_transmit_lfps, mac_transmit_lfps_pclk, o_domain="pclk_tx"
+        )
+
+        # Wire LFPS gen control
+        m.d.comb += [
+            lfps_gen.lfps_active.eq(lfps_active_pclk),
+            lfps_gen.mac_transmit_lfps.eq(mac_transmit_lfps_pclk),
+        ]
+
+        # Wire LFPS gen MAC-side inputs (from PIPE interface)
+        m.d.comb += [
+            lfps_gen.mac_tx_data.eq(self.pipe.tx_data),
+            lfps_gen.mac_tx_data_valid.eq(self.pipe.tx_data_valid),
+            lfps_gen.mac_tx_elec_idle.eq(self.pipe.tx_elec_idle[0]),
+        ]
+
+        # Raw MAC tx_elec_idle → adapter (for LFPS controller + RxDet).
+        # These must see the MAC's original intent, NOT the post-mux value
+        # (which the LFPS gen forces to 0 during PHY-LFPS bursts).
+        m.d.comb += adapter.mac_tx_elec_idle_raw.eq(self.pipe.tx_elec_idle[0])
 
         # ══════════════════════════════════════════════════════════
         #  Step (e): Wire adapter.lane ↔ GowinSerDesLane
@@ -433,12 +523,18 @@ class PIPESerDes(Component):
         #  the adapter and the user-facing component port.
         # ══════════════════════════════════════════════════════════
 
-        # --- Data path ---
+        # --- TX Data path: routed through LFPS gen ---
+        # The LFPS gen (pclk_tx domain) muxes between:
+        #   - Internal LFPS pattern (PHY-LFPS mode, MacTransmitLFPS=0)
+        #   - MAC tx_data passthrough (MAC-LFPS mode or normal data)
+        # Its outputs are combinational and feed the adapter's txpath.
         m.d.comb += [
-            adapter.pipe.tx_data.eq(self.pipe.tx_data),
-            adapter.pipe.tx_data_valid.eq(self.pipe.tx_data_valid),
-            self.pipe.rx_data.eq(adapter.pipe.rx_data),
+            adapter.pipe.tx_data.eq(lfps_gen.tx_data),
+            adapter.pipe.tx_data_valid.eq(lfps_gen.tx_data_valid),
+            adapter.pipe.tx_elec_idle.eq(lfps_gen.tx_elec_idle),
         ]
+        # --- RX Data path: direct from adapter (upar domain) ---
+        m.d.comb += self.pipe.rx_data.eq(adapter.pipe.rx_data)
 
         # --- Clock interface ---
         m.d.comb += [
@@ -454,7 +550,7 @@ class PIPESerDes(Component):
             adapter.pipe.rate.eq(self.pipe.rate),
             adapter.pipe.width.eq(self.pipe.width),
             adapter.pipe.rx_width.eq(self.pipe.rx_width),
-            adapter.pipe.tx_elec_idle.eq(self.pipe.tx_elec_idle),
+            # tx_elec_idle routed through lfps_gen (step d2) — not wired here.
             adapter.pipe.tx_detect_rx_loopback.eq(self.pipe.tx_detect_rx_loopback),
         ]
 
@@ -463,6 +559,8 @@ class PIPESerDes(Component):
             m.d.comb += adapter.pipe.rx_polarity.eq(self.pipe.rx_polarity)
         if hasattr(self.pipe, "rx_termination"):
             m.d.comb += adapter.pipe.rx_termination.eq(self.pipe.rx_termination)
+        # mac_transmit_lfps is routed to PIPELFPSGen in step (d2),
+        # not to the adapter — it's consumed only by the LFPS gen mux.
 
         # USB + SATA shared command signals
         if hasattr(self.pipe, "rx_standby"):
