@@ -264,17 +264,14 @@ class PIPEPowerFSM(Elaboratable):
                     self.quad_pd.eq(0b000),
                     self.current_state.eq(0b0000),
                 ]
-                # Eidle DRP tracking: when MAC deasserts TxElecIdle in P0
-                # (e.g. LFPS→TSEQ transition), write EIDLE_OFF to activate
-                # the TX driver. This matches the Gowin reference where
-                # tx_eidle is set to 0 in P0 when !TxElecIdle, triggering
-                # a CSR write in upar_csr.
-                with m.If(self.eidle_active & ~self.tx_elec_idle & ~self.lfps_active):
-                    m.next = "P0_EIDLE_OFF"
-                with m.Elif(~self.eidle_active & self.tx_elec_idle & ~self.lfps_active):
-                    m.next = "P0_EIDLE_ON"
-                # Gate power transitions during rate change or LFPS
-                with m.If(~self.rate_change_ip & ~self.lfps_active):
+                # Single priority chain — reset > power transitions > eidle.
+                # In Amaranth, last m.next wins, so we use If/Elif to
+                # ensure only one transition fires per cycle.
+                with m.If(~self.reset_n):
+                    # Reset has highest priority
+                    m.next = "RESET"
+                with m.Elif(~self.rate_change_ip & ~self.lfps_active):
+                    # Power transitions (only when not rate-changing or LFPS)
                     with m.If(self.power_down == 0b0001):
                         m.d.sync += target_pd.eq(0b0001)
                         m.next = "P1_ENTER"
@@ -284,9 +281,11 @@ class PIPEPowerFSM(Elaboratable):
                     with m.Elif(self.power_down == 0b0011):
                         m.d.sync += target_pd.eq(0b0011)
                         m.next = "P3_ENTER"
-                # Reset can occur from any state
-                with m.If(~self.reset_n):
-                    m.next = "RESET"
+                    # Eidle tracking (lowest priority within P0)
+                    with m.Elif(self.eidle_active & ~self.tx_elec_idle):
+                        m.next = "P0_EIDLE_OFF"
+                    with m.Elif(~self.eidle_active & self.tx_elec_idle):
+                        m.next = "P0_EIDLE_ON"
 
             # ── P0_EIDLE_OFF ──────────────────────────────────────────
             # MAC deasserted TxElecIdle in P0: write EIDLE CSR to
@@ -297,11 +296,11 @@ class PIPEPowerFSM(Elaboratable):
                     self.drp_wrdata.eq(EIDLE_OFF),
                     self.drp_wren.eq(1),
                 ]
-                with m.If(self.drp_ready):
-                    m.d.sync += self.eidle_active.eq(0)
-                    m.next = "P0_ACTIVE"
                 with m.If(~self.reset_n):
                     m.next = "RESET"
+                with m.Elif(self.drp_ready):
+                    m.d.sync += self.eidle_active.eq(0)
+                    m.next = "P0_ACTIVE"
 
             # ── P0_EIDLE_ON ───────────────────────────────────────────
             # MAC asserted TxElecIdle in P0: write EIDLE CSR to enter
@@ -312,11 +311,11 @@ class PIPEPowerFSM(Elaboratable):
                     self.drp_wrdata.eq(EIDLE_ON),
                     self.drp_wren.eq(1),
                 ]
-                with m.If(self.drp_ready):
-                    m.d.sync += self.eidle_active.eq(1)
-                    m.next = "P0_ACTIVE"
                 with m.If(~self.reset_n):
                     m.next = "RESET"
+                with m.Elif(self.drp_ready):
+                    m.d.sync += self.eidle_active.eq(1)
+                    m.next = "P0_ACTIVE"
 
             # ── P1_ENTER ───────────────────────────────────────────────
             # Transition P0 → P1: write eidle CSR ON.  P1 is a low-latency

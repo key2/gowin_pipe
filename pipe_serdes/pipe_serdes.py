@@ -425,26 +425,19 @@ class PIPESerDes(Component):
             f"[PIPESerDes] LFPS gen instantiated: half_period={lfps_gen.half_period} "
             f"expected_freq={pclk_hz / (2 * lfps_gen.half_period) / 1e6} MHz"
         )
-        m.submodules.lfps_gen = DomainRenamer("pclk_tx")(lfps_gen)
-
-        # CDC: lfps_active (upar → pclk_tx)
-        lfps_active_pclk = Signal(name="lfps_active_pclk")
-        m.submodules += FFSynchronizer(
-            adapter.lfps_active, lfps_active_pclk, o_domain="pclk_tx"
+        # Run LFPS gen in the same domain as the adapter (upar/sync).
+        # This avoids CDC on the 40-bit tx_data path from lfps_gen to
+        # adapter.pipe.tx_data. Previously it ran in pclk_tx (CDR clock)
+        # which crossed to upar unsynchronized — a CDC violation on
+        # multi-bit data.
+        m.submodules.lfps_gen = (
+            lfps_gen  # Same domain as adapter (upar via DomainRenamer)
         )
 
-        # CDC: mac_transmit_lfps (MAC domain → pclk_tx)
-        # The MAC drives this through the PIPE interface;
-        # it changes rarely (once before entering P0 for LFPS).
-        mac_transmit_lfps_pclk = Signal(name="mac_xmit_lfps_pclk")
-        m.submodules += FFSynchronizer(
-            self.pipe.mac_transmit_lfps, mac_transmit_lfps_pclk, o_domain="pclk_tx"
-        )
-
-        # Wire LFPS gen control
+        # Wire LFPS gen control (same domain, no CDC needed)
         m.d.comb += [
-            lfps_gen.lfps_active.eq(lfps_active_pclk),
-            lfps_gen.mac_transmit_lfps.eq(mac_transmit_lfps_pclk),
+            lfps_gen.lfps_active.eq(adapter.lfps_active),
+            lfps_gen.mac_transmit_lfps.eq(self.pipe.mac_transmit_lfps),
         ]
 
         # Wire LFPS gen MAC-side inputs (from PIPE interface)
