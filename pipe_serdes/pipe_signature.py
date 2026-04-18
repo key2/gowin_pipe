@@ -227,5 +227,9 @@ class PIPEDebugSignature(Signature):
                 # GowinSerDes UPAR arbiter internal state (2-bit).
                 # Useful for anti-sweep trees and low-level debug.
                 "serdes_arb_state": Out(2),
+                # RX FIFO almost-empty flag from SerDes lane.
+                "rx_fifo_aempty": Out(1),
+                # RX FIFO empty flag from SerDes lane.
+                "rx_fifo_empty": Out(1),
             }
         )

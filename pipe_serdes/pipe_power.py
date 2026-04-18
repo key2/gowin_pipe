@@ -203,10 +203,15 @@ class PIPEPowerFSM(Elaboratable):
             reset_settle = Signal(9)
 
             with m.State("RESET"):
+                # Gowin reference NEVER asserts PCS resets:
+                #   assign serdes_pcs_rx_rst_o = 1'b0;
+                #   assign serdes_pcs_tx_rst_o = 1'b0;
+                # Match that: keep PCS resets deasserted always.
+                # Only PMA reset is pulsed during power-up.
                 m.d.sync += [
                     self.pma_rstn.eq(0),
-                    self.pcs_rx_rst.eq(1),
-                    self.pcs_tx_rst.eq(1),
+                    self.pcs_rx_rst.eq(0),  # Never assert — match Gowin
+                    self.pcs_tx_rst.eq(0),  # Never assert — match Gowin
                     self.quad_pd.eq(0b010),  # P2 during reset per PIPE spec
                     self.eidle_active.eq(1),
                     self.current_state.eq(0b0010),  # Report P2 during reset
@@ -216,8 +221,6 @@ class PIPEPowerFSM(Elaboratable):
                     with m.If(reset_settle[-1]):  # ~256 cycles ≈ 4 µs at 62.5 MHz
                         m.d.sync += [
                             self.pma_rstn.eq(1),
-                            self.pcs_rx_rst.eq(0),
-                            self.pcs_tx_rst.eq(0),
                             reset_settle.eq(0),
                         ]
                         m.next = "EIDLE_EXIT"
@@ -249,13 +252,28 @@ class PIPEPowerFSM(Elaboratable):
             # power_down[3:0] for MAC-requested state transitions.
             # Transitions are gated during rate change and LFPS activity
             # to avoid DRP conflicts.
+            #
+            # Eidle tracking: the Gowin reference has the pipe interface
+            # FSM write EIDLE_OFF/ON on every TxElecIdle edge in P0.
+            # Our LFPS controller handles EIDLE_OFF at burst start, but
+            # nobody wrote EIDLE_OFF when the MAC deasserts TxElecIdle
+            # to start TSEQ after LFPS. We track eidle_active and write
+            # EIDLE_OFF whenever TxElecIdle drops in P0.
             with m.State("P0_ACTIVE"):
                 m.d.sync += [
                     self.quad_pd.eq(0b000),
                     self.current_state.eq(0b0000),
-                    self.eidle_active.eq(0),
                 ]
-                # Gate transitions during rate change or LFPS
+                # Eidle DRP tracking: when MAC deasserts TxElecIdle in P0
+                # (e.g. LFPS→TSEQ transition), write EIDLE_OFF to activate
+                # the TX driver. This matches the Gowin reference where
+                # tx_eidle is set to 0 in P0 when !TxElecIdle, triggering
+                # a CSR write in upar_csr.
+                with m.If(self.eidle_active & ~self.tx_elec_idle & ~self.lfps_active):
+                    m.next = "P0_EIDLE_OFF"
+                with m.Elif(~self.eidle_active & self.tx_elec_idle & ~self.lfps_active):
+                    m.next = "P0_EIDLE_ON"
+                # Gate power transitions during rate change or LFPS
                 with m.If(~self.rate_change_ip & ~self.lfps_active):
                     with m.If(self.power_down == 0b0001):
                         m.d.sync += target_pd.eq(0b0001)
@@ -267,6 +285,36 @@ class PIPEPowerFSM(Elaboratable):
                         m.d.sync += target_pd.eq(0b0011)
                         m.next = "P3_ENTER"
                 # Reset can occur from any state
+                with m.If(~self.reset_n):
+                    m.next = "RESET"
+
+            # ── P0_EIDLE_OFF ──────────────────────────────────────────
+            # MAC deasserted TxElecIdle in P0: write EIDLE CSR to
+            # activate TX driver. Single DRP write, return to P0_ACTIVE.
+            with m.State("P0_EIDLE_OFF"):
+                m.d.comb += [
+                    self.drp_addr.eq(EIDLE_ADDR),
+                    self.drp_wrdata.eq(EIDLE_OFF),
+                    self.drp_wren.eq(1),
+                ]
+                with m.If(self.drp_ready):
+                    m.d.sync += self.eidle_active.eq(0)
+                    m.next = "P0_ACTIVE"
+                with m.If(~self.reset_n):
+                    m.next = "RESET"
+
+            # ── P0_EIDLE_ON ───────────────────────────────────────────
+            # MAC asserted TxElecIdle in P0: write EIDLE CSR to enter
+            # electrical idle. Single DRP write, return to P0_ACTIVE.
+            with m.State("P0_EIDLE_ON"):
+                m.d.comb += [
+                    self.drp_addr.eq(EIDLE_ADDR),
+                    self.drp_wrdata.eq(EIDLE_ON),
+                    self.drp_wren.eq(1),
+                ]
+                with m.If(self.drp_ready):
+                    m.d.sync += self.eidle_active.eq(1)
+                    m.next = "P0_ACTIVE"
                 with m.If(~self.reset_n):
                     m.next = "RESET"
 

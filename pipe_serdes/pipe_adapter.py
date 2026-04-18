@@ -180,6 +180,7 @@ class LaneRXPortSignature(Signature):
                 "pcs_clkout": In(1),  # RX recovered clock (from lane)
                 "data": In(data_width),  # RX data from deserialiser
                 "fifo_rden": Out(1),  # RX FIFO read enable
+                "fifo_aempty": In(1),  # RX FIFO almost-empty
                 "valid": In(1),  # RX data valid
             }
         )
@@ -617,12 +618,11 @@ class PIPESerDesAdapter(wiring.Component):
         ]
 
         # --- RX FIFO read enable ---
-        # Always read when CDR is locked and lane is in P0.  The RX
-        # FIFO read enable is effectively "RxValid" — when the CDR is
-        # locked and data is flowing, we always consume from the FIFO.
-        m.d.comb += lane.rx.fifo_rden.eq(
-            lane.status.rx_cdr_lock & (power.current_state == 0)
-        )
+        # Matching Gowin reference: read whenever the FIFO has data.
+        # Gowin uses `!serdes_rxfifo_aempty_i`.  Do NOT gate on CDR
+        # lock or power state — the FIFO must always be drained to
+        # avoid overflow.  Invalid data is discarded downstream.
+        m.d.comb += lane.rx.fifo_rden.eq(~lane.rx.fifo_aempty)
 
         # --- Reset routing ---
         # PMA reset: active-low.  Deasserted (high) when power FSM says
@@ -656,6 +656,8 @@ class PIPESerDesAdapter(wiring.Component):
             debug.cdr_lock.eq(lane.status.rx_cdr_lock),
             debug.init_done.eq(init.init_done),
             debug.init_fsm_state.eq(init.fsm_state),
+            debug.rx_fifo_aempty.eq(lane.rx.fifo_aempty),
+            debug.rx_fifo_empty.eq(0),  # TODO: wire when available
         ]
 
         return m

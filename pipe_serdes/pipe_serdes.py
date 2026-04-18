@@ -357,18 +357,27 @@ class PIPESerDes(Component):
         #  happens after the LFPS controller (running in upar/sync)
         #  has completed FFE setup — well after PLL lock.
         #
-        #  We do NOT create a pclk_rx domain here.  The RX path
-        #  stays in the upar domain.  A proper pclk_rx domain
-        #  (from CDR recovered clock) can be added later when
-        #  needed for RX elastic buffer / data processing.
+        #  Fabric clock assignment — matching Gowin reference design:
+        #
+        #  RX fabric clock = reference clock (125 MHz from CMU_CK_REF)
+        #    The SerDes RX FIFO is a CDC FIFO: write side uses the
+        #    CDR-recovered clock internally, read side MUST use an
+        #    independent clock. Using pcs_clkout here violates the
+        #    FIFO's CDC requirements and produces all-ones on rx_data.
+        #
+        #  TX fabric clock = recovered RX PCS clock
+        #    Gowin uses the recovered clock for the TX fabric side.
+        #    This keeps TX synchronous with the incoming data rate.
         # ══════════════════════════════════════════════════════════
         m.d.comb += [
-            lane0.rx.clk.eq(lane0.rx.pcs_clkout),
-            lane0.tx.clk.eq(lane0.tx.pcs_clkout),
+            lane0.rx.clk.eq(
+                lane0.tx.pcs_clkout
+            ),  # TX PCS clock (62.5 MHz, independent from CDR)
+            lane0.tx.clk.eq(lane0.tx.pcs_clkout),  # TX PCS clock
         ]
 
         m.domains += ClockDomain("pclk_tx", local=True, async_reset=True)
-        m.d.comb += ClockSignal("pclk_tx").eq(lane0.tx.pcs_clkout)
+        m.d.comb += ClockSignal("pclk_tx").eq(lane0.rx.pcs_clkout)  # Recovered RX clock
 
         # ══════════════════════════════════════════════════════════
         #  Step (d): Create PIPE adapter (all sub-controllers)
@@ -464,6 +473,7 @@ class PIPESerDes(Component):
         m.d.comb += [
             adapter.lane.rx.data.eq(lane0.rx.data),
             adapter.lane.rx.valid.eq(lane0.rx.valid),
+            adapter.lane.rx.fifo_aempty.eq(lane0.rx.fifo_aempty),
             lane0.rx.fifo_rden.eq(adapter.lane.rx.fifo_rden),
         ]
 
@@ -481,11 +491,20 @@ class PIPESerDes(Component):
             adapter.lane.status.signal_detect.eq(lane0.status.signal_detect),
         ]
 
-        # --- Resets (adapter → lane) ---
+        # --- Resets ---
+        # Matching Gowin reference: PMA reset and PCS resets are never
+        # asserted. The Gowin reference hardwires:
+        #   serdes_pma_rstn_o    = 1   (always deasserted)
+        #   serdes_pcs_rx_rst_o  = 0   (never asserted)
+        #   serdes_pcs_tx_rst_o  = 0   (never asserted)
+        #   serdes_fabric_rstn_o = 1   (always deasserted)
+        # This breaks the circular dependency where:
+        #   Init needs DRP → DRP needs pma_rstn → pma_rstn needs power FSM
+        #   → power FSM needs init_done → init_done needs DRP
         m.d.comb += [
-            lane0.reset.pma_rstn.eq(adapter.lane.reset.pma_rstn),
-            lane0.reset.pcs_rx_rst.eq(adapter.lane.reset.pcs_rx_rst),
-            lane0.reset.pcs_tx_rst.eq(adapter.lane.reset.pcs_tx_rst),
+            lane0.reset.pma_rstn.eq(self.por_n),  # PMA active once POR done
+            lane0.reset.pcs_rx_rst.eq(0),  # Never assert PCS resets
+            lane0.reset.pcs_tx_rst.eq(0),
         ]
 
         # --- Misc lane signals ---

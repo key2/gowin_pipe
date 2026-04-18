@@ -1,6 +1,6 @@
 """LFPS pattern generator and TX data mux for PIPE SerDes.
 
-Generates a 20-100 MHz square wave on ``tx_data`` by alternating
+Generates a 10-50 MHz square wave on ``tx_data`` by alternating
 all-1s and all-0s words at the TX parallel clock rate.  Implements
 both PHY-generated LFPS (default) and MAC-generated LFPS
 (``MacTransmitLFPS=1`` per PIPE spec §8.10).
@@ -14,12 +14,12 @@ Half-period calculation
 Given ``line_rate`` (bps) and ``width`` (bits):
 
     PCLK = line_rate / width
-    N    = round(PCLK / (2 × 50 MHz))      # target center of 20-100 MHz
+    N    = round(PCLK / (2 × 30 MHz))      # target center of [10, 50] MHz
     N    = clamp(N, 1, ...)
     freq = PCLK / (2 × N)                  # actual LFPS frequency
 
-All (rate, width) combinations produce a frequency in the 20-100 MHz
-range required by USB 3.1 §6.9.1.
+All (rate, width) combinations produce a frequency in the 10-50 MHz
+range required by USB 3.0 §6.9.1 (Gen1) / USB 3.1 (Gen2: 12.5-50 MHz).
 
 TX data mux
 -----------
@@ -55,10 +55,12 @@ def lfps_half_period(pclk_hz: int) -> int:
         N — number of PCLK cycles per LFPS half-period.
         Actual LFPS frequency = PCLK / (2 * N).
     """
-    target_hz = 50_000_000  # 50 MHz center of [20, 100] MHz
+    # USB 3.0 Gen1: 10-50 MHz, Gen2: 12.5-50 MHz.
+    # Target the center of the Gen1 range so all configs land in spec.
+    target_hz = 30_000_000  # 30 MHz center of [10, 50] MHz
     n = max(1, round(pclk_hz / (2 * target_hz)))
     actual_hz = pclk_hz / (2 * n)
-    assert 19_000_000 <= actual_hz <= 101_000_000, (
+    assert 9_000_000 <= actual_hz <= 51_000_000, (
         f"LFPS freq {actual_hz / 1e6:.1f} MHz out of range for "
         f"pclk={pclk_hz / 1e6:.1f} MHz"
     )
