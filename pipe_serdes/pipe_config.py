@@ -35,9 +35,17 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Path setup for sibling package
 # ---------------------------------------------------------------------------
-sys.path.insert(0, "/home/key2/Downloads/amaranth/serdes_pipe/gowin-serdes")
+from pathlib import Path as _Path
 
-from gowin_serdes.config import GearRate, EncodingMode, GowinDevice  # noqa: E402
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "gowin-serdes"))
+
+from gowin_serdes.config import (  # noqa: E402
+    GearRate,
+    EncodingMode,
+    GowinDevice,
+    PLLSelection,
+    RefClkSource,
+)
 
 # ---------------------------------------------------------------------------
 # CSR address computation — delegated to gowin_serdes.csr_map (single source
@@ -310,6 +318,13 @@ class PIPELaneConfig:
     enable_msg_bus: bool = True
     enable_mac_clk: bool = True
 
+    # ── SerDes PLL / reference clock (passed through to LaneConfig) ────
+    pll: Optional[PLLSelection] = None  # None → LaneConfig default (CPLL)
+    ref_clk_source: Optional[RefClkSource] = (
+        None  # None → LaneConfig default (Q0_REFCLK0)
+    )
+    ref_clk_freq: Optional[str] = None  # None → LaneConfig default ("125M")
+
     # ── CSR address properties ─────────────────────────────────────────
 
     @property
@@ -379,7 +394,7 @@ class PIPELaneConfig:
         if key not in PIPE_USB_HW_MAP:
             raise ValueError(f"Unsupported (rate={r}, width={w}) combination")
         data_rate_str, pcs_width, gear, enc = PIPE_USB_HW_MAP[key]
-        return LaneConfig(
+        kwargs = dict(
             operation_mode=OperationMode.TX_RX,
             tx_data_rate=data_rate_str,
             rx_data_rate=data_rate_str,
@@ -389,6 +404,14 @@ class PIPELaneConfig:
             tx_encoding=enc,
             rx_encoding=enc,
         )
+        # Forward PLL / refclk overrides when set.
+        if self.pll is not None:
+            kwargs["pll"] = self.pll
+        if self.ref_clk_source is not None:
+            kwargs["ref_clk_source"] = self.ref_clk_source
+        if self.ref_clk_freq is not None:
+            kwargs["ref_clk_freq"] = self.ref_clk_freq
+        return LaneConfig(**kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

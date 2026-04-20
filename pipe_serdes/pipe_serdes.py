@@ -113,7 +113,9 @@ from .pipe_adapter import PIPESerDesAdapter
 from .pipe_lfps_gen import PIPELFPSGen
 
 # Ensure gowin_serdes is importable
-sys.path.insert(0, "/home/key2/Downloads/amaranth/serdes_pipe/gowin-serdes")
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "gowin-serdes"))
 
 from gowin_serdes import GowinSerDes, GowinSerDesGroup  # noqa: E402
 
