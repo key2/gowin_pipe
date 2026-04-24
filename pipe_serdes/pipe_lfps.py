@@ -4,7 +4,7 @@ Manages TX LFPS generation and RX LFPS detection.
 
 TX LFPS: Requires reconfiguring TX driver FFE for LFPS-compliant swing,
 then toggling electrical idle at LFPS burst rate. The entire sequence
-holds the DRP bus lock.
+holds the DRP bus lock during DRP write phases.
 
 RX LFPS: Simply monitors RxElecIdle transitions. The MAC interprets
 the pattern (burst frequency, duration) for LFPS type classification.
@@ -19,32 +19,45 @@ Key concepts from the PIPE spec:
 LFPS FFE Configuration (from CSR map)::
 
     LFPS_FFE_REGS = [
-        (0x808234, 0x0000F000, 0x00000040, "TX FFE_0"),
-        (0x808238, 0x00000000, 0x00000001, "TX FFE_1"),
-        (0x8082D8, 0x00000110, 0x00000003, "TX FFE_2"),
+        (0x808234, 0x0000F000, 0x0000F000, "TX FFE_0"),  # unchanged
+        (0x808238, 0x00000000, 0x00000000, "TX FFE_1"),   # no de-emphasis
+        (0x8082D8, 0x00000110, 0x00000110, "TX FFE_2"),   # reload
     ]
 
 Eidle toggle: addr=0x8003A4, ON=0x01, OFF=0x07.
 
-The LFPS controller is the most complex DRP sequence in the adapter
-due to the FFE save/restore bracketing the burst:
+The LFPS controller sequence matches the working Gowin USB3 PHY reference
+(usb_pipe_interface.v LFPS_0..LFPS_3 + upar_csr.v):
 
     1. Save FFE registers (3 DRP writes with LFPS values)
-    2. Toggle eidle OFF to start burst (1 DRP write)
-    3. Wait for MAC to deassert trigger (burst active)
-    4. Restore FFE registers (3 DRP writes with normal values)
-    5. Release DRP lock
+    2. Write eidle OFF to exit electrical idle (1 DRP write)
+    3. Settle: wait ~33 cycles for TX driver to power up
+    4. LFPS pattern active (lfps_pattern_en asserted, MAC controls duration)
+    5. Write eidle ON for clean burst termination (1 DRP write)
+    6. Restore FFE registers (3 DRP writes with normal values)
+    7. Release DRP lock, return to IDLE
 
-Note: eidle ON is NOT written by this controller. The adapter handles
-eidle transitions based on pipe.tx_elec_idle. This matches the Gowin
-reference design where the pipe interface FSM is the sole owner of
-eidle DRP writes, and avoids a dead zone where the TX driver is stuck
-in eidle after LFPS while the MAC has already started TSEQ.
+Two outputs control different aspects:
+    - ``lfps_active``:     guards power FSM transitions and DRP arbitration.
+                           Asserted in ALL LFPS states except IDLE and
+                           FFE_RESTORE (to allow power FSM eidle writes
+                           and TSEQ data flow during restore).
+    - ``lfps_pattern_en``: gates the PIPELFPSGen pattern generator.
+                           Only asserted in LFPS_ACTIVE state — AFTER
+                           eidle OFF + settling, so the pattern doesn't
+                           start while the TX driver is still in idle.
 """
 
 from amaranth.hdl import Signal, Module, Elaboratable, Const, Array
 
 from gowin_serdes.csr_map import CSR, csr_addr, EIDLE_ON, EIDLE_OFF, lfps_ffe_regs
+
+# Settling delay: number of cycles between EIDLE_OFF and pattern start.
+# Matches the working Gowin reference usb_pipe_interface.v LFPS_1 state
+# which waits 33 cycles (first 15 idle, then 18 active) before LFPS_2.
+# At 62.5 MHz this is ~528 ns; at 125 MHz this is ~264 ns.  Both provide
+# sufficient time for the TX driver analog stage to power up and stabilise.
+LFPS_SETTLE_CYCLES = 33
 
 
 class PIPELFPSController(Elaboratable):
@@ -60,11 +73,10 @@ class PIPELFPSController(Elaboratable):
     TX LFPS Sequence
     ----------------
     The TX driver FFE coefficients must be temporarily reprogrammed to
-    produce the reduced swing required by LFPS. This involves writing
-    three FFE CSRs with LFPS-specific values, toggling the electrical
-    idle control CSR to produce the burst, then restoring the original
-    FFE values. The FSM holds the DRP bus lock for the entire duration
-    to guarantee atomicity.
+    produce full-amplitude LFPS signaling (800-1200 mV per USB 3.2 spec).
+    The FSM holds the DRP bus lock during multi-write phases and provides
+    a settling delay after exiting electrical idle before the pattern
+    generator starts.
 
     Parameters
     ----------
@@ -76,12 +88,8 @@ class PIPELFPSController(Elaboratable):
 
     FSM States::
 
-        IDLE -> FFE_SAVE -> LFPS_EIDLE_OFF -> LFPS_ACTIVE
-             -> FFE_RESTORE -> IDLE
-
-    Note: LFPS_EIDLE_ON was removed — the adapter handles eidle
-    transitions based on pipe.tx_elec_idle, matching the Gowin
-    reference where the pipe interface FSM controls eidle.
+        IDLE -> FFE_SAVE -> LFPS_EIDLE_OFF -> LFPS_SETTLE
+             -> LFPS_ACTIVE -> LFPS_EIDLE_ON -> FFE_RESTORE -> IDLE
 
     RX LFPS
     -------
@@ -108,7 +116,13 @@ class PIPELFPSController(Elaboratable):
     Output Ports
     ------------
     lfps_active : Signal(1)
-        Asserted while the LFPS TX sequence is in progress.
+        Asserted while the LFPS TX sequence is in progress (all states
+        except IDLE and FFE_RESTORE).  Used to gate power FSM
+        transitions and DRP arbitration.
+    lfps_pattern_en : Signal(1)
+        Asserted ONLY in LFPS_ACTIVE state — after EIDLE_OFF + settling.
+        Gates the PIPELFPSGen pattern generator so the all-1s/all-0s
+        square wave is only driven when the TX driver is actually active.
     lfps_tx_done : Signal(1)
         Single-cycle pulse when LFPS TX sequence completes (FFE restored).
     rx_elec_idle : Signal(1)
@@ -139,6 +153,7 @@ class PIPELFPSController(Elaboratable):
 
         # --- Outputs ---
         self.lfps_active = Signal(1)
+        self.lfps_pattern_en = Signal(1)
         self.lfps_tx_done = Signal(1)
         self.rx_elec_idle = Signal(1)
         self.fsm_state = Signal(4)
@@ -159,8 +174,8 @@ class PIPELFPSController(Elaboratable):
 
         # FFE register arrays: (address, normal_value, lfps_value)
         # These three CSRs configure the TX driver FFE coefficients.
-        # Normal values are used during data transmission; LFPS values
-        # produce the reduced swing required for LFPS signaling.
+        # LFPS values = init values (full amplitude, no de-emphasis) to
+        # produce the 800-1200 mV LFPS swing per USB 3.2 Table 6-29.
         ffe_regs = lfps_ffe_regs(self._quad, self._lane)
         NUM_FFE = len(ffe_regs)
         ffe_addrs = Array([Const(addr, 24) for addr, _, _, _ in ffe_regs])
@@ -173,6 +188,11 @@ class PIPELFPSController(Elaboratable):
         # Index into the FFE register arrays (0..2), used by FFE_SAVE and
         # FFE_RESTORE states to iterate over the three registers.
         ffe_idx = Signal(range(NUM_FFE + 1))
+
+        # Settling counter: counts cycles after EIDLE_OFF before LFPS
+        # pattern starts.  Matches the 33-cycle delay in the working
+        # Gowin USB3 PHY reference (usb_pipe_interface.v LFPS_1).
+        settle_cnt = Signal(range(LFPS_SETTLE_CYCLES + 1))
 
         # ------------------------------------------------------------------
         # RX LFPS: pass through the async RxElecIdle from hardware
@@ -202,6 +222,7 @@ class PIPELFPSController(Elaboratable):
             self.drp_wrdata.eq(0),
             self.drp_lock_req.eq(0),
             self.lfps_active.eq(0),
+            self.lfps_pattern_en.eq(0),
         ]
         # lfps_tx_done is a single-cycle pulse; clear it every cycle
         m.d.sync += self.lfps_tx_done.eq(0)
@@ -224,6 +245,8 @@ class PIPELFPSController(Elaboratable):
             # ----------------------------------------------------------
             # Iterates ffe_idx from 0 to NUM_FFE-1, writing the LFPS
             # coefficient to each FFE CSR. Advances on each drp_ready.
+            # lfps_active=1 to block power FSM, but lfps_pattern_en=0
+            # so the LFPS gen does NOT override tx_data yet.
             with m.State("FFE_SAVE"):
                 m.d.sync += self.fsm_state.eq(1)
                 m.d.comb += [
@@ -240,8 +263,11 @@ class PIPELFPSController(Elaboratable):
                         m.d.sync += ffe_idx.eq(ffe_idx + 1)
 
             # ----------------------------------------------------------
-            # LFPS_EIDLE_OFF: Deassert eidle to start LFPS burst
+            # LFPS_EIDLE_OFF: Deassert eidle to start waking TX driver
             # ----------------------------------------------------------
+            # Writes EIDLE_OFF (0x07) to the eidle CSR.  The TX driver
+            # begins powering up but needs time to stabilise.
+            # lfps_pattern_en remains 0 — no data pattern yet.
             with m.State("LFPS_EIDLE_OFF"):
                 m.d.sync += self.fsm_state.eq(2)
                 m.d.comb += [
@@ -252,37 +278,71 @@ class PIPELFPSController(Elaboratable):
                     self.drp_wren.eq(1),
                 ]
                 with m.If(self.drp_ready):
-                    m.next = "LFPS_ACTIVE"
+                    m.d.sync += settle_cnt.eq(0)
+                    m.next = "LFPS_SETTLE"
 
             # ----------------------------------------------------------
-            # LFPS_ACTIVE: Burst in progress, wait for MAC to stop
+            # LFPS_SETTLE: Wait for TX driver to power up and stabilise
             # ----------------------------------------------------------
+            # Matches the 33-cycle staged-release delay from the working
+            # Gowin USB3 PHY reference (usb_pipe_interface.v LFPS_1:
+            # cycles 0-15 keep eidle=1, cycles 16-33 eidle=0).
+            # Since we already wrote EIDLE_OFF, we just wait the full
+            # 33 cycles for the analog to settle.
+            # lfps_active=1 to block power FSM.
+            # lfps_pattern_en=0 — no pattern until settle completes.
+            # DRP lock released so init/power FSMs can proceed if needed.
+            with m.State("LFPS_SETTLE"):
+                m.d.sync += [
+                    self.fsm_state.eq(6),
+                    settle_cnt.eq(settle_cnt + 1),
+                ]
+                m.d.comb += self.lfps_active.eq(1)
+                with m.If(settle_cnt == LFPS_SETTLE_CYCLES - 1):
+                    m.next = "LFPS_ACTIVE"
+                # Abort on reset
+                with m.If(~self.reset_n):
+                    m.d.sync += ffe_idx.eq(0)
+                    m.next = "LFPS_EIDLE_ON"
+
+            # ----------------------------------------------------------
+            # LFPS_ACTIVE: LFPS burst in progress
+            # ----------------------------------------------------------
+            # NOW the pattern generator is enabled (lfps_pattern_en=1).
+            # The PIPELFPSGen muxes in the all-1s/all-0s square wave.
             # The MAC controls burst duration by deasserting the trigger
             # signals. Reset also aborts the sequence.
             #
-            # On stop, go directly to FFE_RESTORE — do NOT write
-            # EIDLE_ON here. The adapter handles eidle DRP writes
-            # based on pipe.tx_elec_idle. Writing EIDLE_ON here would
-            # conflict with the adapter's eidle tracking and create a
-            # dead zone where the TX driver is stuck in eidle after
-            # LFPS while the MAC has already deasserted TxElecIdle
-            # for TSEQ. Matching the Gowin reference: the pipe
-            # interface FSM controls eidle, not the LFPS controller.
+            # On stop: write EIDLE_ON for a clean burst termination
+            # before restoring FFE.
             with m.State("LFPS_ACTIVE"):
                 m.d.sync += self.fsm_state.eq(3)
                 m.d.comb += [
                     self.lfps_active.eq(1),
-                    # drp_lock_req deliberately NOT asserted during ACTIVE.
-                    # No DRP writes happen here — the lock is only needed
-                    # during the multi-write FFE_SAVE/RESTORE sequences.
-                    # Releasing the lock allows the init FSM (client 0) and
-                    # power FSM (client 1) to access the DRP bus while LFPS
-                    # is active. This prevents the init deadlock where
-                    # init_done never goes high because the LFPS lock
-                    # blocks init CSR writes for the entire LFPS duration.
+                    self.lfps_pattern_en.eq(1),
                 ]
                 with m.If(lfps_stop | ~self.reset_n):
                     m.d.sync += ffe_idx.eq(0)
+                    m.next = "LFPS_EIDLE_ON"
+
+            # ----------------------------------------------------------
+            # LFPS_EIDLE_ON: Clean burst termination
+            # ----------------------------------------------------------
+            # Write EIDLE_ON (0x01) to put the TX driver back into
+            # electrical idle with a clean edge.  This matches the
+            # working reference where tx_eidle is reasserted at the
+            # end of the burst (usb_pipe_interface.v:666-669).
+            # lfps_pattern_en=0 — pattern stops, idle on bus.
+            with m.State("LFPS_EIDLE_ON"):
+                m.d.sync += self.fsm_state.eq(4)
+                m.d.comb += [
+                    self.lfps_active.eq(1),
+                    self.drp_lock_req.eq(1),
+                    self.drp_addr.eq(EIDLE_ADDR),
+                    self.drp_wrdata.eq(EIDLE_ON),
+                    self.drp_wren.eq(1),
+                ]
+                with m.If(self.drp_ready):
                     m.next = "FFE_RESTORE"
 
             # ----------------------------------------------------------
@@ -292,22 +352,17 @@ class PIPELFPSController(Elaboratable):
             # (data-mode) coefficients back. On completion, pulses
             # lfps_tx_done and returns to IDLE.
             #
-            # CRITICAL: lfps_active and drp_lock_req are NOT asserted
-            # here. This allows:
-            #   1. PIPELFPSGen to immediately stop overriding tx_data,
-            #      so TSEQ data flows through from the TX pipeline.
-            #   2. The power FSM (higher DRP priority) to write
-            #      EIDLE_OFF immediately, activating the TX driver.
-            # FFE_RESTORE writes interleave behind the eidle write
-            # on the DRP bus, matching the Gowin reference's priority:
-            # eidle first, then FFE.
+            # lfps_active is NOT asserted here. This allows:
+            #   1. PIPELFPSGen to pass through normal MAC tx_data
+            #      (TSEQ etc.) immediately.
+            #   2. The power FSM to write EIDLE_OFF when the MAC
+            #      deasserts TxElecIdle for TSEQ.
+            # The DRP lock is NOT held — FFE_RESTORE writes interleave
+            # with power FSM eidle writes on the DRP bus, matching the
+            # reference priority: eidle first, then FFE.
             with m.State("FFE_RESTORE"):
                 m.d.sync += self.fsm_state.eq(5)
                 m.d.comb += [
-                    # lfps_active deliberately NOT asserted —
-                    # releases tx_data mux for TSEQ
-                    # drp_lock_req deliberately NOT asserted —
-                    # releases DRP bus for power FSM eidle write
                     self.drp_addr.eq(ffe_addrs[ffe_idx]),
                     self.drp_wrdata.eq(ffe_normal[ffe_idx]),
                     self.drp_wren.eq(1),

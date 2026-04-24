@@ -133,6 +133,7 @@ class PIPEPowerFSM(Elaboratable):
         self.power_down = Signal(4, name="power_down")
         self.reset_n = Signal(1, name="reset_n")
         self.tx_elec_idle = Signal(1, name="tx_elec_idle")
+        self.tx_detect_rx = Signal(1, name="power_tx_detect_rx")
         self.pll_lock = Signal(1, name="pll_lock")
         self.cdr_lock = Signal(1, name="cdr_lock")
         self.rate_change_ip = Signal(1, name="rate_change_in_progress")
@@ -270,6 +271,16 @@ class PIPEPowerFSM(Elaboratable):
                 with m.If(~self.reset_n):
                     # Reset has highest priority
                     m.next = "RESET"
+                # LFPS trigger condition: in P0 with TxElecIdle=1 AND
+                # TxDetectRx=1 means LFPS signaling, NOT a normal eidle
+                # transition.  The LFPS FSM handles this case.  We must
+                # block the power FSM from racing into P0_EIDLE_ON on
+                # the same cycle the LFPS FSM triggers, because
+                # lfps_active is still 0 on the trigger cycle (LFPS FSM
+                # hasn't left IDLE yet).  Without this guard the power
+                # FSM writes EIDLE_ON during the LFPS burst, killing it.
+                lfps_trigger_p0 = self.tx_elec_idle & self.tx_detect_rx
+
                 with m.Elif(~self.rate_change_ip & ~self.lfps_active):
                     # Power transitions (only when not rate-changing or LFPS)
                     with m.If(self.power_down == 0b0001):
@@ -281,10 +292,14 @@ class PIPEPowerFSM(Elaboratable):
                     with m.Elif(self.power_down == 0b0011):
                         m.d.sync += target_pd.eq(0b0011)
                         m.next = "P3_ENTER"
-                    # Eidle tracking (lowest priority within P0)
+                    # Eidle tracking (lowest priority within P0).
+                    # Guard against the P0 LFPS trigger to prevent the
+                    # race where both FSMs fire on the same cycle.
                     with m.Elif(self.eidle_active & ~self.tx_elec_idle):
                         m.next = "P0_EIDLE_OFF"
-                    with m.Elif(~self.eidle_active & self.tx_elec_idle):
+                    with m.Elif(
+                        ~self.eidle_active & self.tx_elec_idle & ~lfps_trigger_p0
+                    ):
                         m.next = "P0_EIDLE_ON"
 
             # ── P0_EIDLE_OFF ──────────────────────────────────────────

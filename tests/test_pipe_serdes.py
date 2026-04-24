@@ -1462,7 +1462,7 @@ class TestPIPELFPSController(unittest.TestCase):
             sim.run()
 
     def test_ffe_save_eidle_toggle_ffe_restore(self):
-        """Full LFPS sequence: FFE save -> eidle off -> active -> eidle on -> FFE restore."""
+        """Full LFPS sequence: FFE save -> eidle off -> settle -> active -> eidle on -> FFE restore."""
         dut = PIPELFPSController()
 
         async def testbench(ctx):
@@ -1475,6 +1475,8 @@ class TestPIPELFPSController(unittest.TestCase):
 
             # Should enter FFE_SAVE
             self.assertEqual(ctx.get(dut.lfps_active), 1)
+            # Pattern gen should NOT be active yet (still doing DRP writes)
+            self.assertEqual(ctx.get(dut.lfps_pattern_en), 0)
 
             # Write 3 FFE regs (LFPS values)
             for i in range(3):
@@ -1490,16 +1492,27 @@ class TestPIPELFPSController(unittest.TestCase):
             ctx.set(dut.drp_ready, 0)
             await ctx.tick()
 
-            # LFPS_ACTIVE -- wait for trigger stop
+            # LFPS_SETTLE -- TX driver powering up, pattern NOT active yet
+            self.assertEqual(ctx.get(dut.fsm_state), 6)
+            self.assertEqual(ctx.get(dut.lfps_active), 1)
+            self.assertEqual(ctx.get(dut.lfps_pattern_en), 0)
+
+            # Wait through the 33-cycle settling period
+            for _ in range(33):
+                await ctx.tick()
+
+            # LFPS_ACTIVE -- pattern generator now enabled
             self.assertEqual(ctx.get(dut.fsm_state), 3)
+            self.assertEqual(ctx.get(dut.lfps_pattern_en), 1)
 
             # Stop the trigger by setting eidle=1 (stop condition)
             ctx.set(dut.tx_elec_idle, 1)
             await ctx.tick()
             await ctx.tick()
 
-            # LFPS_EIDLE_ON
+            # LFPS_EIDLE_ON -- clean burst termination
             self.assertEqual(ctx.get(dut.fsm_state), 4)
+            self.assertEqual(ctx.get(dut.lfps_pattern_en), 0)
             ctx.set(dut.drp_ready, 1)
             await ctx.tick()
             ctx.set(dut.drp_ready, 0)
@@ -1603,6 +1616,11 @@ class TestPIPELFPSController(unittest.TestCase):
             ctx.set(dut.drp_ready, 0)
             await ctx.tick()
 
+            # LFPS_SETTLE (state 6) — wait for TX driver to stabilise
+            self.assertEqual(ctx.get(dut.fsm_state), 6)
+            for _ in range(33):
+                await ctx.tick()
+
             # LFPS_ACTIVE
             self.assertEqual(ctx.get(dut.fsm_state), 3)
 
@@ -1636,6 +1654,11 @@ class TestPIPELFPSController(unittest.TestCase):
             await ctx.tick()
             ctx.set(dut.drp_ready, 0)
             await ctx.tick()
+
+            # LFPS_SETTLE — wait for TX driver settle
+            self.assertEqual(ctx.get(dut.fsm_state), 6)
+            for _ in range(33):
+                await ctx.tick()
 
             # LFPS_ACTIVE
             self.assertEqual(ctx.get(dut.fsm_state), 3)

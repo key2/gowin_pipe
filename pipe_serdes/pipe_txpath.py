@@ -42,6 +42,12 @@ class PIPETXPath(Elaboratable):
         self.pipe_tx_elec_idle = Signal(1, name="pipe_tx_elec_idle")
         self.pipe_power_down = Signal(4, name="pipe_power_down")
 
+        # LFPS bypass: when asserted, tx_data is passed through to the
+        # serialiser regardless of power state or elec_idle.  This is
+        # needed because LFPS signaling can happen from P1/P2/P3 states
+        # where the normal P0-only gate would block the data.
+        self.lfps_active = Signal(1, name="txpath_lfps_active")
+
         # QUAD side outputs
         self.quad_tx_data = Signal(80, name="quad_tx_data")
         self.quad_tx_vld = Signal(1, name="quad_tx_vld")
@@ -76,10 +82,16 @@ class PIPETXPath(Elaboratable):
             with m.Case(5):  # 80-bit (custom)
                 m.d.comb += self.quad_tx_data.eq(self.pipe_tx_data[:80])
 
-        # TX valid: only when in P0, data valid asserted, and NOT in electrical idle
-        # (When eidle=1, CSR controls the serializer output, data is ignored)
-        m.d.comb += self.quad_tx_vld.eq(
-            self.pipe_tx_data_valid & in_p0 & ~self.pipe_tx_elec_idle
-        )
+        # TX valid: normally only when in P0, data valid asserted, and NOT
+        # in electrical idle (when eidle=1, CSR controls the serializer
+        # output, data is ignored).
+        #
+        # During LFPS (lfps_active=1): bypass the P0 and elec_idle gates.
+        # LFPS signaling can originate from P1/P2/P3 states (wake-up LFPS),
+        # and the LFPS gen forces tx_elec_idle=0. The LFPS controller has
+        # already written EIDLE_OFF to the CSR, so the data reaches the wire.
+        normal_valid = self.pipe_tx_data_valid & in_p0 & ~self.pipe_tx_elec_idle
+        lfps_valid = self.lfps_active & self.pipe_tx_data_valid
+        m.d.comb += self.quad_tx_vld.eq(normal_valid | lfps_valid)
 
         return m

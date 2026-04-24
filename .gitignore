@@ -18,6 +18,10 @@ example/src/
 *.swp
 *.swo
 
+# Simulation waveforms
+*.vcd
+*.gtkw
+
 # Cache
 .pytest_cache/
 .ruff_cache/

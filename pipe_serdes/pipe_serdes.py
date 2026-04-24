@@ -110,7 +110,7 @@ from amaranth.lib.wiring import Component, In, Out
 from .pipe_config import PIPELaneConfig, PIPEWidth, PIPE_WIDTH_MAP
 from .pipe_signature import PIPESerDesSignature, PIPEDebugSignature
 from .pipe_adapter import PIPESerDesAdapter
-from .pipe_lfps_gen import PIPELFPSGen
+# PIPELFPSGen removed — MAC generates LFPS data directly.
 
 # Ensure gowin_serdes is importable
 from pathlib import Path as _Path
@@ -392,67 +392,19 @@ class PIPESerDes(Component):
         m.submodules.adapter = adapter
 
         # ══════════════════════════════════════════════════════════
-        #  Step (d2): LFPS pattern generator (pclk_tx domain)
+        #  Step (d2): MAC-only LFPS — no PHY pattern generator
         #
-        #  Sits between PIPE tx_data and the adapter txpath.
-        #  In PHY-LFPS mode (MacTransmitLFPS=0): muxes in the
-        #  internal all-1s/all-0s pattern at pclk_tx rate.
-        #  In MAC-LFPS mode (MacTransmitLFPS=1): passes MAC's
-        #  tx_data straight through.
-        #  When not in LFPS: always passes through.
+        #  The MAC is responsible for generating the LFPS data
+        #  pattern (all-1s / all-0s square wave at 10-50 MHz)
+        #  on tx_data.  The PHY's role is limited to:
+        #    - FFE reconfiguration for LFPS amplitude
+        #    - EIDLE CSR toggle (TX driver on/off)
+        #    - Settling delay after EIDLE OFF
+        #    - txpath valid bypass for non-P0 LFPS
         #
-        #  The LFPS gen runs in pclk_tx (TX PCS clock, 125 MHz
-        #  for Gen1 W40).  lfps_active comes from the LFPS
-        #  controller in upar, so we CDC it to pclk_tx.
-        #  mac_transmit_lfps comes from the MAC in whatever domain
-        #  the MAC runs — we CDC it to pclk_tx too.
+        #  tx_data/tx_data_valid/tx_elec_idle flow directly from
+        #  the MAC to the adapter txpath with no mux in between.
         # ══════════════════════════════════════════════════════════
-        fabric_width = cfg.max_data_width
-        # Determine line rate from the first (default) supported rate.
-        # USBRate.GEN1 = 0 → 5 GT/s, USBRate.GEN2 = 1 → 10 GT/s
-        from .pipe_config import USBRate
-
-        default_rate = cfg.supported_rates[0] if cfg.supported_rates else USBRate.GEN1
-        line_rate_hz = 5_000_000_000 if default_rate == USBRate.GEN1 else 10_000_000_000
-
-        # PCS_TX_O_FABRIC_CLK = line_rate / fabric_width (SDR).
-        # Confirmed by hardware counter measurement: 125 MHz for Gen1 W40.
-        pclk_hz = line_rate_hz // fabric_width
-        print(
-            f"[PIPESerDes] LFPS gen: width={fabric_width} line_rate={line_rate_hz / 1e9}G "
-            f"pclk_hz={pclk_hz} ({pclk_hz / 1e6} MHz)"
-        )
-        lfps_gen = PIPELFPSGen(width=fabric_width, pclk_hz=pclk_hz)
-        print(
-            f"[PIPESerDes] LFPS gen instantiated: half_period={lfps_gen.half_period} "
-            f"expected_freq={pclk_hz / (2 * lfps_gen.half_period) / 1e6} MHz"
-        )
-        # Run LFPS gen in the same domain as the adapter (upar/sync).
-        # This avoids CDC on the 40-bit tx_data path from lfps_gen to
-        # adapter.pipe.tx_data. Previously it ran in pclk_tx (CDR clock)
-        # which crossed to upar unsynchronized — a CDC violation on
-        # multi-bit data.
-        m.submodules.lfps_gen = (
-            lfps_gen  # Same domain as adapter (upar via DomainRenamer)
-        )
-
-        # Wire LFPS gen control (same domain, no CDC needed)
-        m.d.comb += [
-            lfps_gen.lfps_active.eq(adapter.lfps_active),
-            lfps_gen.mac_transmit_lfps.eq(self.pipe.mac_transmit_lfps),
-        ]
-
-        # Wire LFPS gen MAC-side inputs (from PIPE interface)
-        m.d.comb += [
-            lfps_gen.mac_tx_data.eq(self.pipe.tx_data),
-            lfps_gen.mac_tx_data_valid.eq(self.pipe.tx_data_valid),
-            lfps_gen.mac_tx_elec_idle.eq(self.pipe.tx_elec_idle[0]),
-        ]
-
-        # Raw MAC tx_elec_idle → adapter (for LFPS controller + RxDet).
-        # These must see the MAC's original intent, NOT the post-mux value
-        # (which the LFPS gen forces to 0 during PHY-LFPS bursts).
-        m.d.comb += adapter.mac_tx_elec_idle_raw.eq(self.pipe.tx_elec_idle[0])
 
         # ══════════════════════════════════════════════════════════
         #  Step (e): Wire adapter.lane ↔ GowinSerDesLane
@@ -537,15 +489,13 @@ class PIPESerDes(Component):
         #  the adapter and the user-facing component port.
         # ══════════════════════════════════════════════════════════
 
-        # --- TX Data path: routed through LFPS gen ---
-        # The LFPS gen (pclk_tx domain) muxes between:
-        #   - Internal LFPS pattern (PHY-LFPS mode, MacTransmitLFPS=0)
-        #   - MAC tx_data passthrough (MAC-LFPS mode or normal data)
-        # Its outputs are combinational and feed the adapter's txpath.
+        # --- TX Data path: direct from MAC ---
+        # No PHY-side LFPS pattern generator — the MAC generates LFPS
+        # data directly on tx_data.  The PHY handles FFE/EIDLE via DRP.
         m.d.comb += [
-            adapter.pipe.tx_data.eq(lfps_gen.tx_data),
-            adapter.pipe.tx_data_valid.eq(lfps_gen.tx_data_valid),
-            adapter.pipe.tx_elec_idle.eq(lfps_gen.tx_elec_idle),
+            adapter.pipe.tx_data.eq(self.pipe.tx_data),
+            adapter.pipe.tx_data_valid.eq(self.pipe.tx_data_valid),
+            adapter.pipe.tx_elec_idle.eq(self.pipe.tx_elec_idle),
         ]
         # --- RX Data path: direct from adapter (upar domain) ---
         m.d.comb += self.pipe.rx_data.eq(adapter.pipe.rx_data)
@@ -564,7 +514,6 @@ class PIPESerDes(Component):
             adapter.pipe.rate.eq(self.pipe.rate),
             adapter.pipe.width.eq(self.pipe.width),
             adapter.pipe.rx_width.eq(self.pipe.rx_width),
-            # tx_elec_idle routed through lfps_gen (step d2) — not wired here.
             adapter.pipe.tx_detect_rx_loopback.eq(self.pipe.tx_detect_rx_loopback),
         ]
 
@@ -573,8 +522,9 @@ class PIPESerDes(Component):
             m.d.comb += adapter.pipe.rx_polarity.eq(self.pipe.rx_polarity)
         if hasattr(self.pipe, "rx_termination"):
             m.d.comb += adapter.pipe.rx_termination.eq(self.pipe.rx_termination)
-        # mac_transmit_lfps is routed to PIPELFPSGen in step (d2),
-        # not to the adapter — it's consumed only by the LFPS gen mux.
+        # mac_transmit_lfps: no longer used — the MAC always generates
+        # LFPS data directly.  Signal kept in PIPE signature for
+        # compatibility but not consumed by PHY hardware.
 
         # USB + SATA shared command signals
         if hasattr(self.pipe, "rx_standby"):
